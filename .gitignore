@@ -16,6 +16,7 @@
 
 # Local configuration file (sdk path, etc)
 local.properties
+.sdkmanrc
 
 # Eclipse project files
 .classpath

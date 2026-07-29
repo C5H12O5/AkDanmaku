@@ -3,7 +3,7 @@ buildscript {
     ext {
         kotlin_version = "1.5.30"
         // LibGdx sdk version.
-        gdxVersion = '1.10.0'
+        gdxVersion = '1.13.0'
         ashleyVersion = '1.7.3'
     }
 
@@ -34,4 +34,3 @@ allprojects {
 task clean(type: Delete) {
     delete rootProject.buildDir
 }
-

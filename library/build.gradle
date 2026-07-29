@@ -47,9 +47,8 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.6.0'
 }
 
-// called every time gradle gets executed, takes the native dependencies of
-// the natives configuration, and extracts them to the proper jniLibs/ folders
-// so they get packed with the APK.
+// Extract native dependencies before Android snapshots jniLibs. This prevents
+// stale binaries from being packaged when the LibGDX version changes.
 task copyAndroidNatives {
     doFirst {
         file("jniLibs/armeabi/").mkdirs()
@@ -76,9 +75,6 @@ task copyAndroidNatives {
     }
 }
 
-tasks.whenTaskAdded { packageTask ->
-    if (packageTask.name.contains("package")) {
-        packageTask.dependsOn 'copyAndroidNatives'
-    }
+tasks.named('preBuild').configure {
+    dependsOn copyAndroidNatives
 }
-

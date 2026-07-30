@@ -23,9 +23,6 @@ ext {
     PUBLISH_ARTIFACT_ID = "akdanmaku"
 }
 
-ext['signing.keyId'] = ''
-ext['signing.password'] = ''
-ext['signing.secretKeyRingFile'] = ''
 ext['ossrhUsername'] = ''
 ext['ossrhPassword'] = ''
 
@@ -109,6 +106,12 @@ afterEvaluate {
         }
     }
     signing {
+        // Local publications are intentionally unsigned; repository uploads must remain signed.
+        required = {
+            gradle.taskGraph.allTasks.any {
+                it instanceof org.gradle.api.publish.maven.tasks.PublishToMavenRepository
+            }
+        }
         sign publishing.publications.release
     }
 }

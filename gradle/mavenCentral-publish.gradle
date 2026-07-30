@@ -3,15 +3,21 @@ apply plugin: 'signing'
 
 task androidSourcesJar(type: Jar) {
     if (project.hasProperty('android')) {
-        from android.sourceSets.main.java.sourceFiles
+        from(android.sourceSets.main.java.srcDirs) {
+            include '**/*.java'
+            include '**/*.kt'
+        }
     } else {
         from sourceSets.main.allSource
     }
-    classifier 'sources'
+    archiveClassifier.set('sources')
 }
 task javadocJar(type: Jar) {
+    from rootProject.file('README.md')
+    from(rootProject.file('docs')) {
+        into 'docs'
+    }
     archiveClassifier.set('javadoc')
-    classifier 'javadoc'
 }
 tasks.withType(Javadoc) {
     options.addStringOption('Xdoclint:none', '-quiet')
@@ -48,8 +54,11 @@ afterEvaluate {
                 version VERSION_NAME
 
                if (project.hasProperty("android")) {
-                   artifact("$buildDir/outputs/aar/library-release.aar")
+                   artifact("$buildDir/outputs/aar/library-release.aar") {
+                       builtBy tasks.named('bundleReleaseAar')
+                   }
                    artifact androidSourcesJar
+                   artifact javadocJar
                } else {
                    artifact("$buildDir/libs/${project.getName()}.jar")
                    artifact androidSourcesJar
@@ -95,6 +104,10 @@ afterEvaluate {
         }
         repositories {
             maven {
+                name = 'LocalStaging'
+                url = uri("$buildDir/repos/staging")
+            }
+            maven {
                 name = 'AkDanmaku'
                 url = 'https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/'
 
@@ -106,10 +119,11 @@ afterEvaluate {
         }
     }
     signing {
-        // Local publications are intentionally unsigned; repository uploads must remain signed.
+        // File repositories are unsigned for local validation; remote uploads must remain signed.
         required = {
             gradle.taskGraph.allTasks.any {
-                it instanceof org.gradle.api.publish.maven.tasks.PublishToMavenRepository
+                it instanceof org.gradle.api.publish.maven.tasks.PublishToMavenRepository &&
+                    it.repository.url.scheme != 'file'
             }
         }
         sign publishing.publications.release

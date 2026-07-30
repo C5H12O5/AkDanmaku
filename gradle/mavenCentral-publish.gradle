@@ -29,22 +29,33 @@ ext {
     PUBLISH_ARTIFACT_ID = "akdanmaku"
 }
 
-ext['ossrhUsername'] = ''
-ext['ossrhPassword'] = ''
-
-File secretPropsFile = project.rootProject.file('local.properties')
-if (secretPropsFile.exists()) {
-    println 'Found secret props file, loading props'
-    Properties p = new Properties()
-    p.load(new FileInputStream(secretPropsFile))
-    p.each { name, value ->
-        ext[name] = value
-    }
-} else {
-    println 'No props file, loading env vars'
-}
-
 afterEvaluate {
+    def releaseSigningRequested = gradle.startParameter.taskNames.any {
+        ['centralBundle', 'signReleasePublication'].contains(it.tokenize(':').last())
+    }
+    def publicationPath = "${GROUP.replace('.', '/')}/${PUBLISH_ARTIFACT_ID}/${VERSION_NAME}"
+    def clearCentralBundleStaging = tasks.register('clearCentralBundleStaging', Delete) {
+        delete "$buildDir/repos/staging/$publicationPath"
+    }
+    def publishToLocalStagingTaskName = 'publishReleasePublicationToLocalStagingRepository'
+    tasks.matching { it.name == publishToLocalStagingTaskName }.configureEach {
+        mustRunAfter clearCentralBundleStaging
+    }
+    tasks.register('centralBundle', Zip) {
+        group = 'publishing'
+        description = 'Builds a signed Maven Central deployment bundle.'
+        dependsOn clearCentralBundleStaging, publishToLocalStagingTaskName
+        from("$buildDir/repos/staging") {
+            include "$publicationPath/**"
+            exclude '**/*.asc.md5'
+            exclude '**/*.asc.sha1'
+            exclude '**/*.asc.sha256'
+            exclude '**/*.asc.sha512'
+        }
+        archiveFileName.set("${PUBLISH_ARTIFACT_ID}-${VERSION_NAME}-central-bundle.zip")
+        destinationDirectory.set(file("$buildDir/distributions"))
+    }
+
     publishing {
         publications {
             release(MavenPublication) {
@@ -107,25 +118,26 @@ afterEvaluate {
                 name = 'LocalStaging'
                 url = uri("$buildDir/repos/staging")
             }
-            maven {
-                name = 'AkDanmaku'
-                url = 'https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/'
-
-                credentials {
-                    username ossrhUsername
-                    password ossrhPassword
-                }
-            }
         }
     }
     signing {
-        // File repositories are unsigned for local validation; remote uploads must remain signed.
-        required = {
-            gradle.taskGraph.allTasks.any {
-                it instanceof org.gradle.api.publish.maven.tasks.PublishToMavenRepository &&
-                    it.repository.url.scheme != 'file'
+        if (releaseSigningRequested) {
+            def signingKey = findProperty('signingKey')
+            if (signingKey) {
+                useInMemoryPgpKeys(signingKey, findProperty('signingPassword'))
+            } else {
+                if (!project.hasProperty('signing.gnupg.executable')) {
+                    project.ext['signing.gnupg.executable'] = 'gpg'
+                }
+                if (!project.hasProperty('signing.gnupg.keyName')) {
+                    project.ext['signing.gnupg.keyName'] = PUBLISH_SIGNING_KEY
+                }
+                useGpgCmd()
             }
         }
+
+        // Local validation stays unsigned unless the upload bundle is requested.
+        required = { releaseSigningRequested }
         sign publishing.publications.release
     }
 }

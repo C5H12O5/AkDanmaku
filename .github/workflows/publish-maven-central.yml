@@ -1,0 +1,271 @@
+name: Publish Maven Central
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maven-central-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish tagged release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: maven-central
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 11
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: gradle
+
+      - name: Validate release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version_count="$(grep -c '^VERSION_NAME=' gradle.properties || true)"
+          version="$(sed -n 's/^VERSION_NAME=//p' gradle.properties)"
+          if [[ "$version_count" -ne 1 || -z "$version" ]]; then
+            echo "::error::gradle.properties must contain exactly one VERSION_NAME"
+            exit 1
+          fi
+
+          if [[ "$version" == *-SNAPSHOT ]]; then
+            echo "::error::Snapshot versions cannot be published to Maven Central"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match VERSION_NAME=${version}"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/kaloscope; then
+            echo "::error::Tag commit is not part of the kaloscope branch"
+            exit 1
+          fi
+
+          fingerprint="$(sed -n 's/^PUBLISH_SIGNING_KEY=//p' gradle.properties)"
+          if [[ ! "$fingerprint" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+            echo "::error::PUBLISH_SIGNING_KEY must be a full OpenPGP fingerprint"
+            exit 1
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$(printf '%s' "$fingerprint" | tr '[:lower:]' '[:upper:]')" >> "$GITHUB_OUTPUT"
+          echo "bundle=library/build/distributions/akdanmaku-${version}-central-bundle.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed Central bundle
+        shell: bash
+        env:
+          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+          EXPECTED_FINGERPRINT: ${{ steps.release.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$ORG_GRADLE_PROJECT_signingKey" ]]; then
+            echo "::error::MAVEN_GPG_PRIVATE_KEY is not configured"
+            exit 1
+          fi
+          if [[ -z "$ORG_GRADLE_PROJECT_signingPassword" ]]; then
+            echo "::error::MAVEN_GPG_PASSPHRASE is not configured"
+            exit 1
+          fi
+
+          key_home="$(mktemp -d "${RUNNER_TEMP}/akdanmaku-key.XXXXXX")"
+          chmod 700 "$key_home"
+          cleanup_key_home() {
+            gpgconf --homedir "$key_home" --kill all >/dev/null 2>&1 || true
+            if [[ "$key_home" == "${RUNNER_TEMP}"/akdanmaku-key.* ]]; then
+              rm -rf -- "$key_home"
+            fi
+          }
+          trap cleanup_key_home EXIT
+
+          printf '%s' "$ORG_GRADLE_PROJECT_signingKey" |
+            gpg --batch --homedir "$key_home" --import >/dev/null 2>&1
+
+          actual_fingerprint="$(
+            gpg --batch --homedir "$key_home" --with-colons --list-secret-keys |
+              awk -F: '$1 == "fpr" { print toupper($10); exit }'
+          )"
+          if [[ "$actual_fingerprint" != "$EXPECTED_FINGERPRINT" ]]; then
+            echo "::error::MAVEN_GPG_PRIVATE_KEY does not match PUBLISH_SIGNING_KEY"
+            exit 1
+          fi
+
+          gpg --batch --homedir "$key_home" --armor \
+            --output "${RUNNER_TEMP}/maven-central-public-key.asc" \
+            --export "$EXPECTED_FINGERPRINT"
+
+          cleanup_key_home
+          trap - EXIT
+          ./gradlew :library:centralBundle --no-daemon
+
+      - name: Verify Central bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-central-bundle.py \
+            "${{ steps.release.outputs.bundle }}" \
+            "${RUNNER_TEMP}/maven-central-public-key.asc" \
+            "${{ steps.release.outputs.fingerprint }}"
+
+      - name: Upload automatic deployment
+        id: upload
+        shell: bash
+        env:
+          CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          BUNDLE_PATH: ${{ steps.release.outputs.bundle }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$CENTRAL_USERNAME" || -z "$CENTRAL_PASSWORD" ]]; then
+            echo "::error::Maven Central Portal credentials are not configured"
+            exit 1
+          fi
+
+          authorization="$(
+            printf '%s:%s' "$CENTRAL_USERNAME" "$CENTRAL_PASSWORD" | base64 --wrap=0
+          )"
+          echo "::add-mask::$authorization"
+
+          response="${RUNNER_TEMP}/central-upload-response.txt"
+          http_code="$(
+            curl --silent --show-error \
+              --connect-timeout 20 \
+              --max-time 180 \
+              --output "$response" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer ${authorization}" \
+              --form "bundle=@${BUNDLE_PATH};type=application/octet-stream" \
+              --url "https://central.sonatype.com/api/v1/publisher/upload" \
+              --url-query "name=akdanmaku-${RELEASE_VERSION}" \
+              --url-query "publishingType=AUTOMATIC"
+          )"
+          if [[ "$http_code" != "201" ]]; then
+            echo "::error::Central upload failed with HTTP ${http_code}"
+            sed -n '1,80p' "$response"
+            exit 1
+          fi
+
+          deployment_id="$(tr -d '\r\n' < "$response")"
+          if [[ ! "$deployment_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo "::error::Central returned an invalid deployment ID"
+            exit 1
+          fi
+
+          echo "deployment_id=${deployment_id}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Maven Central deployment"
+            echo
+            echo "- Version: \`${RELEASE_VERSION}\`"
+            echo "- Deployment ID: \`${deployment_id}\`"
+            echo "- Publishing type: \`AUTOMATIC\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for publication
+        shell: bash
+        env:
+          CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          DEPLOYMENT_ID: ${{ steps.upload.outputs.deployment_id }}
+        run: |
+          set -euo pipefail
+
+          authorization="$(
+            printf '%s:%s' "$CENTRAL_USERNAME" "$CENTRAL_PASSWORD" | base64 --wrap=0
+          )"
+          echo "::add-mask::$authorization"
+
+          response="${RUNNER_TEMP}/central-status-response.json"
+          deadline=$((SECONDS + 1800))
+          while (( SECONDS < deadline )); do
+            if ! http_code="$(
+              curl --silent --show-error \
+                --connect-timeout 20 \
+                --max-time 60 \
+                --output "$response" \
+                --write-out '%{http_code}' \
+                --request POST \
+                --header "Authorization: Bearer ${authorization}" \
+                --url "https://central.sonatype.com/api/v1/publisher/status" \
+                --url-query "id=${DEPLOYMENT_ID}"
+            )"; then
+              echo "::warning::Central status request failed; retrying"
+              sleep 15
+              continue
+            fi
+
+            case "$http_code" in
+              200)
+                ;;
+              404 | 408 | 425 | 429 | 5??)
+                echo "::warning::Central status returned HTTP ${http_code}; retrying"
+                sleep 15
+                continue
+                ;;
+              *)
+                echo "::error::Central status failed with HTTP ${http_code}"
+                sed -n '1,80p' "$response"
+                exit 1
+                ;;
+            esac
+
+            if ! state="$(jq -er '.deploymentState' "$response")"; then
+              echo "::error::Central status response has no deploymentState"
+              sed -n '1,80p' "$response"
+              exit 1
+            fi
+            echo "Central deployment state: ${state}"
+
+            case "$state" in
+              PUBLISHED)
+                {
+                  echo "- Final state: \`PUBLISHED\`"
+                  echo "- Portal: https://central.sonatype.com/publishing"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+                ;;
+              FAILED)
+                echo "::error::Central validation or publication failed"
+                jq '.errors // []' "$response"
+                {
+                  echo "- Final state: \`FAILED\`"
+                  echo "- Portal: https://central.sonatype.com/publishing"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+                ;;
+              PENDING | VALIDATING | VALIDATED | PUBLISHING)
+                sleep 15
+                ;;
+              *)
+                echo "::error::Unknown Central deployment state: ${state}"
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "::error::Timed out waiting for Central deployment ${DEPLOYMENT_ID}"
+          {
+            echo "- Final state: \`TIMEOUT\`"
+            echo "- Check before rerunning: https://central.sonatype.com/publishing"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
